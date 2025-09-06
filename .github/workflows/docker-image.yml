@@ -13,7 +13,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/comfyui-mints
+  IMAGE_OWNER: ${{ toLower(github.repository_owner) }}  # 強制小寫
+  IMAGE_NAME: comfyui-mints                            # 你要的映像名稱（保持小寫）
 
 jobs:
   build_and_push_image:
@@ -44,7 +45,7 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:py311-cu121
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:py311-cu121
           cache-from: type=gha
           cache-to: type=gha,mode=max

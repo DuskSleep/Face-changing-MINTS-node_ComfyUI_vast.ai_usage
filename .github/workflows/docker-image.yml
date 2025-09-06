@@ -13,8 +13,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_OWNER: ${{ toLower(github.repository_owner) }}  # 強制小寫
-  IMAGE_NAME: comfyui-mints                            # 你要的映像名稱（保持小寫）
+  IMAGE_NAME: comfyui-mints   # 映像名稱請保持小寫
 
 jobs:
   build_and_push_image:
@@ -23,6 +22,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Derive lowercase owner
+        id: vars
+        shell: bash
+        run: |
+          owner="${{ github.repository_owner }}"
+          echo "owner_lc=${owner,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -45,7 +51,5 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/${{ env.IMAGE_NAME }}:py311-cu121
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner

@@ -1,55 +1,51 @@
-name: docker-image
+# syntax=docker/dockerfile:1.7
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
 
-on:
-  push:
-    branches: ["main"]
-    tags:
-      - "v*"
-  workflow_dispatch:
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    VENV_PATH=/venv \
+    COMFY_ROOT=/opt/ComfyUI \
+    SCRIPTS=/opt/scripts \
+    COMFY_PORT=8188
 
-permissions:
-  contents: read
-  packages: write
+# 基本套件 + Python 3.11
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      software-properties-common ca-certificates curl git gosu tini \
+      build-essential pkg-config libgl1 libglib2.0-0 ffmpeg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+      python3.11 python3.11-venv python3.11-dev \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && python3.11 -m venv "$VENV_PATH" \
+    && "$VENV_PATH/bin/pip" install --upgrade pip wheel setuptools \
+    && rm -rf /var/lib/apt/lists/*
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: comfyui-mints   # 映像名稱請保持小寫
+# 取得 ComfyUI
+RUN git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_ROOT"
 
-jobs:
-  build_and_push_image:
-    runs-on: ubuntu-latest
+# 安裝 Torch(CUDA 12.1) + ComfyUI 需求
+RUN "$VENV_PATH/bin/pip" install --extra-index-url https://download.pytorch.org/whl/cu121 \
+      torch torchvision torchaudio \
+    && "$VENV_PATH/bin/pip" install -r "$COMFY_ROOT/requirements.txt"
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+# 可掛載的目錄
+VOLUME ["/opt/ComfyUI/models", "/opt/ComfyUI/custom_nodes", "/data"]
 
-      - name: Derive lowercase owner
-        id: vars
-        shell: bash
-        run: |
-          owner="${{ github.repository_owner }}"
-          echo "owner_lc=${owner,,}" >> "$GITHUB_OUTPUT"
+# 非 root 執行
+RUN useradd -m -u 1000 app && chown -R app:app /opt /venv
+USER app
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+# 啟動腳本
+RUN mkdir -p "$SCRIPTS"
+COPY --chown=app:app <<'EOF' "$SCRIPTS/start.sh"
+#!/usr/bin/env bash
+set -euo pipefail
+source "$VENV_PATH/bin/activate"
+cd "$COMFY_ROOT"
+exec python main.py --listen 0.0.0.0 --port "${COMFY_PORT}"
+EOF
+RUN chmod +x "$SCRIPTS/start.sh"
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push (linux/amd64)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner_lc }}/${{ env.IMAGE_NAME }}:latest
-            ${{ env.REGISTRY }}/${{ steps.vars.outputs.owner
+EXPOSE 8188
+ENTRYPOINT ["/usr/bin/tini","--"]
+CMD ["/opt/scripts/start.sh"]

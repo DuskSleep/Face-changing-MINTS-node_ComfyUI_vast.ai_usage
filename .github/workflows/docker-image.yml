@@ -3,8 +3,7 @@ name: docker-image
 on:
   push:
     branches: ["main"]
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
@@ -22,6 +21,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # 先大量釋放 runner 硬碟空間（可釋放 20~30GB）
+      - name: Maximize disk space on runner
+        shell: bash
+        run: |
+          set -eux
+          df -h
+          sudo rm -rf /usr/local/lib/android       || true
+          sudo rm -rf /usr/share/dotnet            || true
+          sudo rm -rf /opt/ghc                     || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo apt-get clean
+          sudo docker system prune -af || true
+          df -h
 
       - name: Derive lowercase owner
         id: vars
@@ -62,3 +75,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: false          # 關閉 SBOM/Provenance 省空間
+
+      # 保險：結束後把 buildx 殘留快取清掉
+      - name: Prune builder cache
+        if: always()
+        run: |
+          docker buildx prune -af || true
+          docker system prune -af || true

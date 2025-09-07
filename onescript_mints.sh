@@ -148,4 +148,60 @@ for name in "${!REPOS[@]}"; do
     echo "[INFO] 安裝 ${name}"
     if ! manager_install_repo "${MANAGER_BASE}" "${REPOS[$name]}"; then
       echo "[WARN] Manager 安裝失敗，改用 git：${name}"
-      git_clone_fallback "${REPOS[$name]}" "$de
+      git_clone_fallback "${REPOS[$name]}" "$dest"
+    fi
+    # 可選：針對四個關鍵節點支援 pin commit（避免新版改介面導致必接線）
+    sha_var="PIN_$(echo "$name" | tr '[:lower:]' '[:upper:]' | tr -s '_' '_' | sed 's/^COMFYUI_//')_SHA"
+    sha_val="${!sha_var:-}"
+    if [ -n "$sha_val" ] && [ -d "$dest/.git" ]; then
+      git -C "$dest" fetch --all --tags || true
+      git -C "$dest" checkout "$sha_val" || true
+    fi
+  fi
+done
+
+# ===== 對關鍵節點做 Try fix（補其 pip 依賴）=====
+try_fix "${MANAGER_BASE}" "ComfyUI_LayerStyle" || true
+try_fix "${MANAGER_BASE}" "ComfyUI_LayerStyle_Advance" || true
+try_fix "${MANAGER_BASE}" "ComfyUI_InstantID" || true
+try_fix "${MANAGER_BASE}" "ComfyUI_FaceAnalysis" || true
+
+# ===== 安裝你列的模型到指定路徑 =====
+cd "$COMFY_ROOT"
+# checkpoint
+[ -f "models/checkpoints/juggernautXL_v9Rdphoto2Lightning.safetensors" ] || \
+curl -fsSL -o models/checkpoints/juggernautXL_v9Rdphoto2Lightning.safetensors \
+  "https://huggingface.co/AiWise/Juggernaut-XL-V9-GE-RDPhoto2-Lightning_4S/resolve/main/juggernautXL_v9Rdphoto2Lightning.safetensors"
+# InstantID
+[ -f "models/instantid/ip-adapter.bin" ] || \
+curl -fsSL -o models/instantid/ip-adapter.bin \
+  "https://huggingface.co/InstantX/InstantID/resolve/main/ip-adapter.bin"
+# InstantID ControlNet
+[ -f "models/controlnet/diffusion_pytorch_model.safetensors" ] || \
+curl -fsSL -o models/controlnet/diffusion_pytorch_model.safetensors \
+  "https://huggingface.co/InstantX/InstantID/resolve/main/ControlNetModel/diffusion_pytorch_model.safetensors"
+# TTPlanet Tile
+[ -f "models/controlnet/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors" ] || \
+curl -fsSL -o models/controlnet/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors \
+  "https://huggingface.co/TTPlanet/TTPLanet_SDXL_Controlnet_Tile_Realistic/resolve/main/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors"
+# Upscale + .pth 別名
+[ -f "models/upscale_models/2xNomosUni_span_multijpg_ldl.safetensors" ] || \
+curl -fsSL -o models/upscale_models/2xNomosUni_span_multijpg_ldl.safetensors \
+  "https://huggingface.co/Phips/2xNomosUni_span_multijpg_ldl/resolve/main/2xNomosUni_span_multijpg_ldl.safetensors"
+[ -f "models/upscale_models/2xNomosUni_span_multijpg_ldl.pth" ] || \
+ln -s "2xNomosUni_span_multijpg_ldl.safetensors" "models/upscale_models/2xNomosUni_span_multijpg_ldl.pth" || true
+
+# ===== 修復 antelopev2（刪殘檔→安裝到正確位置）=====
+pushd models/insightface/models >/dev/null
+rm -rf antelopev2 antelopev2.zip || true
+curl -fsSL -o antelopev2.zip "https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip"
+unzip -o antelopev2.zip >/dev/null && rm -f antelopev2.zip
+popd >/dev/null
+
+# ===== 重啟並等待就緒 =====
+start_comfy
+wait_http_ok "${API_BASE}/"
+wait_object_info
+
+echo "[OK] 安裝與修復完成。Workflow: ${WF_NAME}"
+echo "[OK] 若仍出現『節點必須接線』，可用環境變數 PIN_*_SHA 鎖定舊版節點（例：PIN_LAYERSTYLE_SHA=<commit>)."

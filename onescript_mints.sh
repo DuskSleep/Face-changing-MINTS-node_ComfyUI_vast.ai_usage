@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# === 可調參數（已改：預設到 /workspace）===
+# === 可調參數（預設到 /workspace）===
 export COMFY_ROOT="${COMFY_ROOT:-/workspace/ComfyUI}"
 export COMFY_PORT="${COMFY_PORT:-8188}"
 export VENV_PATH="${VENV_PATH:-/venv}"
 export PY_BIN="${PY_BIN:-python3.11}"
-export HF_HEADERS="Authorization: Bearer ${HF_TOKEN:-}"   # 若需私模可設 HF_TOKEN
 export CURL_RETRY="--retry 5 --retry-delay 2 --fail -L"
 export WORKFLOW_URL="${WORKFLOW_URL:-https://raw.githubusercontent.com/DuskSleep/Face-changing-MINTS-node_ComfyUI_vast.ai_usage/main/%E6%8D%A2%E8%84%B8-MINTS.json}"
 
-# === 檢查 Python 版本（必須 3.11）===
+# === Python 版本嚴格鎖 3.11 ===
 if ! command -v ${PY_BIN} >/dev/null 2>&1; then
-  echo "[ERR] 找不到 ${PY_BIN}，請先在映像或容器裝好 Python 3.11"; exit 1
+  echo "[ERR] 找不到 ${PY_BIN}，請先安裝 Python 3.11"; exit 1
 fi
 PYV="$(${PY_BIN} -c 'import sys;print(".".join(map(str,sys.version_info[:2])))')"
 if [ "$PYV" != "3.11" ]; then
-  echo "[ERR] 檢測到 Python ${PYV}，本堆疊嚴格鎖 3.11；請調整基底映像或安裝對應版。"; exit 2
+  echo "[ERR] 偵測到 Python ${PYV}，此堆疊僅支援 3.11"; exit 2
 fi
 
-# === 目錄就緒 ===
+# === 路徑就緒 ===
 mkdir -p "$COMFY_ROOT" "$VENV_PATH" \
          "$COMFY_ROOT/models/checkpoints" \
          "$COMFY_ROOT/models/instantid" \
          "$COMFY_ROOT/models/controlnet" \
          "$COMFY_ROOT/models/upscale_models" \
          "$COMFY_ROOT/models/insightface/models" \
-         "$COMFY_ROOT/user/default/workflows"
+         "$COMFY_ROOT/user/default/workflows" \
+         "$COMFY_ROOT/custom_nodes"
 
 # === venv 就緒 ===
 if [ ! -f "$VENV_PATH/bin/activate" ]; then
@@ -49,7 +49,7 @@ else
   git -C "$MANAGER_DIR" pull --ff-only || true
 fi
 
-# === 降低 ComfyUI-Manager 安全等級到 weak（允許從 GitHub 安裝）===
+# === 降低安全等級到 weak（允許 GitHub 安裝）===
 CONFIG_A="${MANAGER_DIR}/config.ini"
 CONFIG_B="${COMFY_ROOT}/user/default/ComfyUI-Manager/config.ini"
 mkdir -p "$(dirname "$CONFIG_B")"
@@ -62,10 +62,15 @@ for CFG in "$CONFIG_A" "$CONFIG_B"; do
   fi
 done
 
-# === 依賴（InstantID / InsightFace / Mediapipe 等）===
+# === 依賴（InstantID / InsightFace / Mediapipe / LayerStyle Advance）===
+# onnxruntime-gpu 1.19+ 針對 CUDA 12.x；使用 contrib 版 OpenCV 以含 ximgproc
+python -m pip uninstall -y opencv-python || true
 python -m pip install -U \
-  "onnx>=1.16" "onnxruntime-gpu>=1.20,<1.22" \
-  "insightface==0.7.3" "mediapipe>=0.10" "opencv-python" "tqdm" "requests"
+  "onnx>=1.16" "onnxruntime-gpu>=1.19" \
+  "insightface==0.7.3" "mediapipe>=0.10" \
+  "tqdm" "requests" \
+  "blend-modes>=2.2.0" "psd-tools" "hydra-core==1.3.2" "docopt==0.6.2" \
+  "opencv-contrib-python>=4.8,<4.11"
 
 # === 先啟一次 ComfyUI 讓 Manager API 可用（若已啟動則略過）===
 if ! curl -s "http://127.0.0.1:${COMFY_PORT}/" >/dev/null 2>&1; then
@@ -76,12 +81,13 @@ if ! curl -s "http://127.0.0.1:${COMFY_PORT}/" >/dev/null 2>&1; then
   done
 fi
 
-# === 缺失節點：先試 Manager API，失敗就 git clone + pip ===
+# === 缺失節點清單（先 Manager API，失敗就 git clone）===
 declare -A REPOS=(
   ["comfy_mtb"]="https://github.com/melMass/comfy_mtb"                            # Note Plus (mtb)
   ["ComfyMath"]="https://github.com/evanspearman/ComfyMath"                        # CM_Number* / CM_Int*
   ["ComfyUI_Comfyroll_CustomNodes"]="https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"  # CR *
   ["comfyui-various"]="https://github.com/jamesWalker55/comfyui-various"           # JW*
+  ["ComfyUI_LayerStyle_Advance"]="https://github.com/chflame163/ComfyUI_LayerStyle_Advance"   # LayerStyle Advance
 )
 CUSTOM_DIR="${COMFY_ROOT}/custom_nodes"
 
@@ -115,7 +121,7 @@ done
 # === 模型下載與放置 ===
 cd "$COMFY_ROOT"
 
-# 1) Checkpoints
+# 1) Checkpoint
 if [ ! -f "models/checkpoints/juggernautXL_v9Rdphoto2Lightning.safetensors" ]; then
   curl ${CURL_RETRY} -o models/checkpoints/juggernautXL_v9Rdphoto2Lightning.safetensors \
     "https://huggingface.co/AiWise/Juggernaut-XL-V9-GE-RDPhoto2-Lightning_4S/resolve/main/juggernautXL_v9Rdphoto2Lightning.safetensors"
@@ -140,7 +146,7 @@ if [ ! -f "models/controlnet/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetens
     "https://huggingface.co/TTPlanet/TTPLanet_SDXL_Controlnet_Tile_Realistic/resolve/main/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors"
 fi
 
-# 5) Upscale model：safetensors + 建立 .pth 連結（讓舊工作流不用改名）
+# 5) Upscale model：safetensors + 同名 .pth 連結
 if [ ! -f "models/upscale_models/2xNomosUni_span_multijpg_ldl.safetensors" ]; then
   curl ${CURL_RETRY} -o models/upscale_models/2xNomosUni_span_multijpg_ldl.safetensors \
     "https://huggingface.co/Phips/2xNomosUni_span_multijpg_ldl/resolve/main/2xNomosUni_span_multijpg_ldl.safetensors"
@@ -149,7 +155,7 @@ if [ ! -f "models/upscale_models/2xNomosUni_span_multijpg_ldl.pth" ]; then
   ln -s "2xNomosUni_span_multijpg_ldl.safetensors" "models/upscale_models/2xNomosUni_span_multijpg_ldl.pth" || true
 fi
 
-# 6) InsightFace 模型（修復 antelopev2 放錯位置）
+# 6) InsightFace 模型（修復 antelopev2 放置位置）
 pushd models/insightface/models >/dev/null
 rm -rf antelopev2 antelopev2.zip || true
 curl ${CURL_RETRY} -o antelopev2.zip \
@@ -157,13 +163,12 @@ curl ${CURL_RETRY} -o antelopev2.zip \
 unzip -o antelopev2.zip && rm -f antelopev2.zip
 popd >/dev/null
 
-# 7) 匯入你的工作流（放到 ComfyUI 的 workflows 夾）
+# 7) 匯入你的工作流（放到 workflows 夾）
 WF_NAME="$(basename "${WORKFLOW_URL}")"
 curl ${CURL_RETRY} -o "${COMFY_ROOT}/user/default/workflows/${WF_NAME}" "${WORKFLOW_URL}"
 
-# === 收尾：重啟 ComfyUI（以確保節點/模型被掃描）===
+# === 收尾：重啟 ComfyUI 以掃描新節點/模型 ===
 pkill -f "${COMFY_ROOT}/main.py" || true
 sleep 1
 nohup "$VENV_PATH/bin/python" "${COMFY_ROOT}/main.py" --listen 0.0.0.0 --port "${COMFY_PORT}" >/tmp/comfy.log 2>&1 &
 echo "[OK] 安裝完成；ComfyUI 執行中（port ${COMFY_PORT}）。"
-echo "[HINT] 如果有 Cloudflare/代理，重啟後請把代理 URL 再填回。"

@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 # install-from-workflow.sh
-# 根據「换脸-MINTS.json」工作流做離線缺失節點比對，然後只安裝你紀錄列出的節點 & 模型。
-# 位置固定在 /workspace/ComfyUI（可用 --dir 覆蓋），Python 僅提示需 3.11，不強改版本。
+# 依「换脸-MINTS.json」工作流比對缺失 → 放寬 Manager → 安裝指定節點 → 安裝 5 模型 → 修 insightface v0.7/antelopev2
+# 僅做你紀錄列出的內容；全程在 /workspace/ComfyUI（可用 --dir 覆蓋）；不動 apt。
 set -euo pipefail
 
 # ===== 參數 =====
 COMFY_DIR="/workspace/ComfyUI"
 VENV="/venv"
 COMFY_PORT="8188"
-MAX_WAIT="480"
+BASE=""                 # 自訂 API base，例如 https://xxx.cloudflare…
 WORKFLOW_URL="https://raw.githubusercontent.com/DuskSleep/Face-changing-MINTS-node_ComfyUI_vast.ai_usage/main/%E6%8D%A2%E8%84%B8-MINTS.json"
+MAX_WAIT="480"
+SKIP_WAIT="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dir) COMFY_DIR="$2"; shift 2;;
-    --venv) VENV="$2"; shift 2;;
-    --port) COMFY_PORT="$2"; shift 2;;
-    --max-wait) MAX_WAIT="$2"; shift 2;;
-    --workflow) WORKFLOW_URL="$2"; shift 2;;
+    --dir)       COMFY_DIR="$2"; shift 2;;
+    --venv)      VENV="$2"; shift 2;;
+    --port)      COMFY_PORT="$2"; shift 2;;
+    --workflow)  WORKFLOW_URL="$2"; shift 2;;
+    --max-wait)  MAX_WAIT="$2"; shift 2;;
+    --skip-wait) SKIP_WAIT="1"; shift 1;;
+    --base)      BASE="$2"; shift 2;; # 例：--base https://your-cf-domain.example
     *) echo "Unknown arg: $1"; exit 1;;
   esac
 done
@@ -26,32 +30,36 @@ cyan(){ printf "\033[1;36m%s\033[0m" "$1"; }
 log(){ printf "\n%s %s\n" "$(cyan "[mints]")" "$*"; }
 warn(){ printf "\n\033[1;33m[mints WARN]\033[0m %s\n" "$*"; }
 
-need(){
-  command -v "$1" >/dev/null 2>&1 || { warn "missing '$1'"; return 1; }
-}
-
-PIP="$VENV/bin/pip"
-[[ -x "$PIP" ]] || PIP="python3 -m pip"
-
-# ===== 基本檢查 =====
+PIP="$VENV/bin/pip"; [[ -x "$PIP" ]] || PIP="python3 -m pip"
 [[ -d "$COMFY_DIR" ]] || { echo "COMFY_DIR not found: $COMFY_DIR"; exit 1; }
+
+# Python 版本提示（僅警告，不變更）
 PYV="$(python3 -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "unknown")"
 if [[ "$PYV" != "3.11" ]]; then
-  warn "Python 要求 3.11，目前: $PYV（將繼續執行，但可能遇到兼容性問題）"
+  warn "建議 Python 3.11，當前 $PYV（繼續執行，但可能遇到相容性問題）"
 fi
 
-# ===== 等待 ComfyUI API 就緒（/object_info）=====
-log "等待 ComfyUI 127.0.0.1:${COMFY_PORT}（最多 ${MAX_WAIT}s）..."
-t=0
-until curl -fsS "http://127.0.0.1:${COMFY_PORT}/object_info" >/dev/null 2>&1; do
-  sleep 3; t=$((t+3))
-  if [[ $t -ge $MAX_WAIT ]]; then
-    warn "逾時，仍繼續。"
-    break
-  fi
-done
+# ===== 準備 API base =====
+if [[ -z "$BASE" ]]; then
+  BASE="http://127.0.0.1:${COMFY_PORT}"
+fi
 
-# ===== 降低 Manager 安全等級為 weak（兩處都寫）=====
+# ===== 等待 ComfyUI /object_info 就緒（或跳過）=====
+if [[ "$SKIP_WAIT" = "0" ]]; then
+  log "等待 ComfyUI ${BASE}/object_info（最多 ${MAX_WAIT}s）..."
+  t=0
+  until curl -fsS "${BASE}/object_info" >/dev/null 2>&1; do
+    sleep 3; t=$((t+3))
+    if [[ $t -ge $MAX_WAIT ]]; then
+      warn "逾時，繼續執行。你也可用 --skip-wait 或 --base 換檢查位址。"
+      break
+    fi
+  done
+else
+  log "跳過等待 ComfyUI。"
+fi
+
+# ===== Manager 安全等級改 weak（兩個位置都寫）=====
 log "設定 ComfyUI-Manager security_level=weak ..."
 for cfg in \
   "$COMFY_DIR/custom_nodes/ComfyUI-Manager/config.ini" \
@@ -66,105 +74,89 @@ do
   fi
 done
 
-# ===== 下載工作流（離線解析用，不走 Web UI）=====
+# ===== 下載工作流（離線解析，不開 web）=====
 TMPD="$(mktemp -d)"; WF="$TMPD/workflow.json"
 log "抓取工作流：$WORKFLOW_URL"
 curl -fL --retry 3 --retry-delay 2 -o "$WF" "$WORKFLOW_URL"
 
-# ===== 取出「已安裝節點清單」與「工作流需要的節點」，計算缺失 =====
+# ===== 取得可用節點 & 解析工作流節點 → 計算缺失（修正：不再用 tail，直接取命令輸出）=====
 log "比對工作流所需節點 vs 當前可用節點 ..."
-python3 - "$COMFY_PORT" "$WF" <<'PY'
-import json, sys, urllib.request
-port, wf_path = sys.argv[1], sys.argv[2]
-
-# 1) 取得目前可用節點（/object_info）
-avail = set()
+MISS_JSON="$(
+python3 - <<PY
+import json, os, sys, urllib.request
+base = os.environ.get("BASE_INNER")
+wf_path = os.environ.get("WF_INNER")
+avail=set()
+# 1) /object_info（若失敗也允許繼續）
 try:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/object_info", timeout=5) as r:
-        data = json.load(r)
-        # 形態可能是 { "CheckpointLoaderSimple": {...}, "KSampler": {...}, ... }
+    with urllib.request.urlopen(base + "/object_info", timeout=5) as r:
+        data=json.load(r)
         if isinstance(data, dict):
-            avail = set(k for k in data.keys() if isinstance(k, str))
+            avail=set(k for k in data.keys() if isinstance(k,str))
 except Exception:
     pass
-
-# 2) 解析工作流，抓 class_type / type
-need = set()
-with open(wf_path, 'r', encoding='utf-8') as f:
-    wf = json.load(f)
+# 2) 解析工作流（class_type/type）
+need=set()
+with open(wf_path,"r",encoding="utf-8") as f:
+    wf=json.load(f)
 nodes = wf.get("nodes") or []
 for n in nodes:
     ct = n.get("class_type") or n.get("type")
-    if isinstance(ct, str):
-        need.add(ct)
-
+    if isinstance(ct,str): need.add(ct)
 missing = sorted(need - avail)
-print(json.dumps({"need": sorted(need), "avail_count": len(avail), "missing": missing}, ensure_ascii=False))
+print(json.dumps({"need":sorted(need), "avail_count":len(avail), "missing":missing}, ensure_ascii=False))
 PY
-MISS_JSON="$(tail -n1)"
+)"
+echo "$MISS_JSON"
 
-# 解析缺失字串為 bash 陣列
-MISSING=()
-if [[ "$MISS_JSON" =~ \"missing\":\ \[(.*)\] ]]; then
-  # 粗略擷取，後續仍會判斷模式
-  :
-fi
-# 直接交給 python 再列一遍乾淨清單
+# 轉成陣列
 readarray -t MISSING < <(python3 - <<'PY' "$MISS_JSON"
-import sys, json
+import json,sys
 data=json.loads(sys.argv[1])
-for x in data.get("missing", []):
-    print(x)
+for x in data.get("missing",[]): print(x)
 PY
 "$MISS_JSON"
 )
 
-log "缺失節點：${#MISSING[@]} 個"
-for m in "${MISSING[@]}"; do echo " - $m"; done
-
-# ===== 依你的「紀錄」只安裝 4 個指定節點包（依缺失來決定是否裝）=====
-install_repo(){
-  local repo="$1" name="$2"
-  local dest="$COMFY_DIR/custom_nodes/$name"
-  if [[ -d "$dest/.git" ]]; then
-    git -C "$dest" pull --ff-only || true
-  elif [[ -d "$dest" ]]; then
-    # 目錄存在但不是 git，略過避免覆蓋
-    :
-  else
-    git clone --depth=1 "$repo" "$dest"
+# ===== 安裝你紀錄指定的四個節點（依缺失觸發，並保險補齊一次）=====
+clone_or_update(){ # repo url, target dir
+  local repo="$1" dir="$2"
+  if [[ -d "$dir/.git" ]]; then git -C "$dir" pull --ff-only || true
+  else git clone --depth=1 "$repo" "$dir"
   fi
 }
 
-needs_repo=false
+log "安裝/更新缺失節點（僅限：mtb / ComfyMath / Comfyroll / various）..."
+mkdir -p "$COMFY_DIR/custom_nodes"
+
+# 依缺失名稱判斷需哪個 repo
 for m in "${MISSING[@]}"; do
   case "$m" in
-    Note*|*mtb* )               install_repo "https://github.com/melMass/comfy_mtb" "comfy_mtb"; needs_repo=true;;
-    CM_* )                      install_repo "https://github.com/evanspearman/ComfyMath" "ComfyMath"; needs_repo=true;;
-    "CR "* )                    install_repo "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes" "ComfyUI_Comfyroll_CustomNodes"; needs_repo=true;;
-    JW* )                       install_repo "https://github.com/jamesWalker55/comfyui-various" "comfyui-various"; needs_repo=true;;
-    * ) :;;
+    Note*|*mtb* )
+      clone_or_update "https://github.com/melMass/comfy_mtb" "$COMFY_DIR/custom_nodes/comfy_mtb";;
+    CM_* )
+      clone_or_update "https://github.com/evanspearman/ComfyMath" "$COMFY_DIR/custom_nodes/ComfyMath";;
+    "CR Upscale Image"|"CR Prompt Text" )
+      clone_or_update "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes" "$COMFY_DIR/custom_nodes/ComfyUI_Comfyroll_CustomNodes";;
+    JW* )
+      clone_or_update "https://github.com/jamesWalker55/comfyui-various" "$COMFY_DIR/custom_nodes/comfyui-various";;
   esac
 done
 
-# 若工作流沒有缺失（或缺失不屬於這四包），仍依「紀錄」檢查一下四包是否已存在；不存在就補裝
-check_or_install(){
-  local path="$1" repo="$2" name="$3"
-  [[ -d "$path" ]] || install_repo "$repo" "$name"
-}
-check_or_install "$COMFY_DIR/custom_nodes/comfy_mtb"                       "https://github.com/melMass/comfy_mtb"                       "comfy_mtb"
-check_or_install "$COMFY_DIR/custom_nodes/ComfyMath"                       "https://github.com/evanspearman/ComfyMath"                  "ComfyMath"
-check_or_install "$COMFY_DIR/custom_nodes/ComfyUI_Comfyroll_CustomNodes"   "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes"    "ComfyUI_Comfyroll_CustomNodes"
-check_or_install "$COMFY_DIR/custom_nodes/comfyui-various"                 "https://github.com/jamesWalker55/comfyui-various"           "comfyui-various"
+# 保險：若四個資料夾有缺就補
+[[ -d "$COMFY_DIR/custom_nodes/comfy_mtb" ]] || clone_or_update "https://github.com/melMass/comfy_mtb" "$COMFY_DIR/custom_nodes/comfy_mtb"
+[[ -d "$COMFY_DIR/custom_nodes/ComfyMath" ]] || clone_or_update "https://github.com/evanspearman/ComfyMath" "$COMFY_DIR/custom_nodes/ComfyMath"
+[[ -d "$COMFY_DIR/custom_nodes/ComfyUI_Comfyroll_CustomNodes" ]] || clone_or_update "https://github.com/Suzie1/ComfyUI_Comfyroll_CustomNodes" "$COMFY_DIR/custom_nodes/ComfyUI_Comfyroll_CustomNodes"
+[[ -d "$COMFY_DIR/custom_nodes/comfyui-various" ]] || clone_or_update "https://github.com/jamesWalker55/comfyui-various" "$COMFY_DIR/custom_nodes/comfyui-various"
 
-# ===== 安裝依賴（僅你紀錄需要的：mediapipe + 常見基礎）=====
-log "安裝必要依賴（Py3.11 友善）..."
+# ===== 安裝必要 Python 依賴（僅你紀錄會用到的）=====
+log "安裝必要依賴（不動 apt）..."
 $PIP install -q --disable-pip-version-check \
   "mediapipe==0.10.14" \
   "opencv-python-headless==4.10.*" "scikit-image" "pymatting" "guided-filter" \
   || warn "部分依賴安裝失敗，可稍後重試"
 
-# ===== 安裝模型（完全照你的紀錄與路徑）=====
+# ===== 下載模型（完全照你的紀錄與路徑）=====
 log "下載/放置模型 ..."
 mkdir -p "$COMFY_DIR/models/checkpoints" \
          "$COMFY_DIR/models/instantid" \
@@ -196,13 +188,13 @@ dl "https://huggingface.co/InstantX/InstantID/resolve/main/ControlNetModel/diffu
 dl "https://huggingface.co/TTPlanet/TTPLanet_SDXL_Controlnet_Tile_Realistic/resolve/main/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors" \
    "$COMFY_DIR/models/controlnet/TTPLANET_Controlnet_Tile_realistic_v2_fp16.safetensors"
 
-# 4) Upscaler（僅有 safetensors）
+# 4) Upscaler（僅 .safetensors）
 dl "https://huggingface.co/Phips/2xNomosUni_span_multijpg_ldl/resolve/main/2xNomosUni_span_multijpg_ldl.safetensors" \
    "$COMFY_DIR/models/upscale_models/2xNomosUni_span_multijpg_ldl.safetensors"
 [[ -e "$COMFY_DIR/models/upscale_models/2xNomosUni_span_multijpg_ldl.pth" ]] || \
 ln -s "2xNomosUni_span_multijpg_ldl.safetensors" "$COMFY_DIR/models/upscale_models/2xNomosUni_span_multijpg_ldl.pth" 2>/dev/null || true
 
-# ===== 修復 insightface v0.7 / antelopev2 到正確路徑 =====
+# ===== 修復 insightface v0.7 / antelopev2 =====
 log "修復 insightface/antelopev2 ..."
 INS="$COMFY_DIR/models/insightface/models"
 mkdir -p "$INS"; rm -rf "$INS/antelopev2" "$INS/antelopev2.zip" || true
@@ -211,10 +203,9 @@ curl -fL -o "$ZIP" "https://github.com/deepinsight/insightface/releases/download
 if command -v unzip >/dev/null 2>&1; then
   unzip -o "$ZIP" -d "$TMPA/unzip" >/dev/null 2>&1 || true
 else
-  python3 - <<'PY'
+  python3 - "$ZIP" "$TMPA/unzip" <<'PY'
 import sys,zipfile,os; z=sys.argv[1];d=sys.argv[2];os.makedirs(d,exist_ok=True); zipfile.ZipFile(z).extractall(d)
 PY
-  "$ZIP" "$TMPA/unzip"
 fi
 if [[ -d "$TMPA/unzip/antelopev2" ]]; then
   mv "$TMPA/unzip/antelopev2" "$INS/antelopev2"
@@ -223,30 +214,30 @@ else
 fi
 rm -rf "$TMPA"
 
-# ===== 收尾：再次列出缺失（此處僅比對名稱；如需 UI Reload，請手動 Reload or 重啟）=====
-log "安裝完成。重新比對（名稱層級；新節點如未在本輪 API 出現，Reload 後即會出現）..."
-python3 - "$COMFY_PORT" "$WF" <<'PY'
-import json, sys, urllib.request, time
-port, wf_path = sys.argv[1], sys.argv[2]
+# ===== 收尾：再次列出缺失（新節點可能需在 UI 內 Reload 才會顯示）=====
+log "安裝完成。重新比對（如仍有少量 missing，請在 UI 做一次：Manager → Reload Custom Nodes）..."
+python3 - <<PY
+import json, os, urllib.request, time
+base=os.environ["BASE_INNER"]
+wf_path=os.environ["WF_INNER"]
+time.sleep(1)
 need=set()
-with open(wf_path,'r',encoding='utf-8') as f:
+with open(wf_path,"r",encoding="utf-8") as f:
     wf=json.load(f)
-for n in wf.get("nodes",[]):
+for n in wf.get("nodes",[]): 
     ct=n.get("class_type") or n.get("type")
     if isinstance(ct,str): need.add(ct)
-time.sleep(1)
 avail=set()
 try:
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}/object_info", timeout=5) as r:
+    with urllib.request.urlopen(base + "/object_info", timeout=5) as r:
         data=json.load(r)
-        if isinstance(data,dict):
-            avail=set(k for k in data.keys() if isinstance(k,str))
+        if isinstance(data,dict): avail=set(k for k in data.keys() if isinstance(k,str))
 except Exception:
     pass
-missing = sorted(need - avail)
-print(json.dumps({"missing_after_install": missing}, ensure_ascii=False))
+print(json.dumps({"missing_after_install": sorted(need - avail)}, ensure_ascii=False))
 PY
-
 echo
-echo "📌 若仍顯示少量 missing，多半只需在 UI 做一次「Reload Custom Nodes」或重啟 ComfyUI 即會就緒。"
-echo "📌 你紀錄要求的 5 個模型 & antelopev2 已就位；2xNomos… 也建立了 .pth 相容連結。"
+echo "📌 模型與 antelopev2 已放置完成；如工作流仍報缺，Reload Custom Nodes 後再跑一次推理即可。"
+
+# ===== 傳遞變數給 Python 子程序 =====
+#（放在最後避免污染上面邏輯）
